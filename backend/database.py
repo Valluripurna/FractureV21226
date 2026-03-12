@@ -1,6 +1,6 @@
 import os
 from pymongo import MongoClient
-from datetime import datetime
+from datetime import datetime, timedelta
 import gridfs
 import hashlib
 import io
@@ -191,3 +191,91 @@ def get_image_by_id(image_id):
     except Exception as e:
         _enable_memory_store_due_to_error(e)
         return get_image_by_id(image_id)
+
+
+def get_analytics_summary(days: int = 30):
+        """Compute high-level analytics over recent reports.
+
+        Returns a dict with:
+            - total_scans
+            - scans_per_day: list of {date, count}
+            - fracture_rate
+            - average_confidence
+            - body_region_distribution: list of {region, count}
+        """
+        now = datetime.now()
+        since = now - timedelta(days=days)
+
+        # Collect reports from either memory store or MongoDB
+        if _use_memory_store:
+            reports = [r for r in _mem_reports.values() if r.get('created_at') and r['created_at'] >= since]
+        else:
+            try:
+                cursor = reports_collection.find({"created_at": {"$gte": since}})
+                reports = list(cursor)
+            except Exception as e:
+                _enable_memory_store_due_to_error(e)
+                reports = [r for r in _mem_reports.values() if r.get('created_at') and r['created_at'] >= since]
+
+        total = len(reports)
+        if total == 0:
+            return {
+                'total_scans': 0,
+                'scans_per_day': [],
+                'fracture_rate': 0.0,
+                'average_confidence': 0.0,
+                'body_region_distribution': [],
+                'window_days': days,
+            }
+
+        scans_per_day = {}
+        fracture_count = 0
+        confidence_sum = 0.0
+        confidence_count = 0
+        region_counts = {}
+
+        for r in reports:
+            created_at = r.get('created_at', now)
+            if isinstance(created_at, datetime):
+                day_key = created_at.strftime('%Y-%m-%d')
+            else:
+                # Fallback if stored as string
+                day_key = str(created_at)[:10]
+            scans_per_day[day_key] = scans_per_day.get(day_key, 0) + 1
+
+            data = r.get('report_data', {}) or {}
+            if data.get('fracture_detected'):
+                fracture_count += 1
+
+            conf = data.get('confidence')
+            try:
+                if conf is not None:
+                    confidence_sum += float(conf)
+                    confidence_count += 1
+            except Exception:
+                pass
+
+            region = data.get('body_region') or 'Unknown'
+            region_counts[region] = region_counts.get(region, 0) + 1
+
+        scans_per_day_list = [
+            {'date': d, 'count': scans_per_day[d]}
+            for d in sorted(scans_per_day.keys())
+        ]
+
+        fracture_rate = fracture_count / total if total else 0.0
+        avg_conf = (confidence_sum / confidence_count) if confidence_count else 0.0
+
+        body_region_distribution = [
+            {'region': k, 'count': v}
+            for k, v in sorted(region_counts.items(), key=lambda kv: kv[1], reverse=True)
+        ]
+
+        return {
+            'total_scans': total,
+            'scans_per_day': scans_per_day_list,
+            'fracture_rate': fracture_rate,
+            'average_confidence': avg_conf,
+            'body_region_distribution': body_region_distribution,
+            'window_days': days,
+        }

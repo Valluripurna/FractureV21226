@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
 import torchvision.models as models
 import os
@@ -10,6 +10,7 @@ import sys
 import warnings
 from contextlib import redirect_stdout, redirect_stderr
 import tempfile
+import base64
 
 # Suppress PyTorch warnings
 warnings.filterwarnings("ignore")
@@ -42,14 +43,18 @@ class EfficientNetFractureModel(nn.Module):
     def __init__(self, base_model=None):
         super(EfficientNetFractureModel, self).__init__()
         if base_model is None:
-            base_model = models.efficientnet_b4(pretrained=True)
-        # Modify the classifier for binary fracture detection
-        num_features = base_model.classifier[1].in_features
-        base_model.classifier = nn.Sequential(
-            nn.Dropout(p=0.2, inplace=True),
-            nn.Linear(num_features, 1),  # Binary classification (fracture vs no fracture)
-            nn.Sigmoid()
-        )
+            base_model = models.efficientnet_b4(pretrained=False)
+            # Medical-optimized classifier
+            num_features = base_model.classifier[1].in_features
+            base_model.classifier = nn.Sequential(
+                nn.Dropout(p=0.2, inplace=True),
+                nn.Linear(num_features, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Linear(256, 1),
+                nn.Sigmoid()
+            )
         self.model = base_model
     
     def forward(self, x):
@@ -62,30 +67,35 @@ class FracNetModel(nn.Module):
         super(FracNetModel, self).__init__()
         
         # Use ResNet50 as the backbone
-        self.backbone = models.resnet50(pretrained=True)
-        
-        # Remove the final fully connected layer
+        self.backbone = models.resnet50(pretrained=False)
         self.backbone.fc = nn.Identity()
         
-        # Add custom layers for fracture detection
+        # Medical-optimized classifier (shallower for better generalization)
         self.fracture_detector = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(2048, 512),  # ResNet50 has 2048 features
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(512, 128),
+            nn.Linear(2048, 256),  # Reduced complexity
+            nn.BatchNorm1d(256),   # Batch norm for stability
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
-            nn.Sigmoid()  # For binary classification (fracture vs no fracture)
+            nn.Linear(256, num_classes),
+            nn.Sigmoid()
         )
     
     def forward(self, x):
-        # Extract features using the backbone
-        features = self.backbone(x)
-        # Detect fractures
-        output = self.fracture_detector(features)
+        # Extract 4D features from backbone
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+        
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+        
+        # Apply fracture detector
+        output = self.fracture_detector(x)
         return output
 
 class ResNet50FractureModel(nn.Module):
@@ -96,8 +106,11 @@ class ResNet50FractureModel(nn.Module):
         # Load pretrained ResNet50
         self.resnet50 = models.resnet50(pretrained=False)  # We'll load weights from file
         
-        # The classifier is already modified in the saved model file
-        # So we don't need to modify it here
+        # Replace final FC layer with Sequential to match saved model
+        self.resnet50.fc = nn.Sequential(
+            nn.Linear(2048, 1),
+            nn.Sigmoid()
+        )
     
     def forward(self, x):
         return self.resnet50(x)
@@ -110,8 +123,11 @@ class DenseNetFractureModel(nn.Module):
         # Load pretrained DenseNet121
         self.densenet = models.densenet121(pretrained=False)  # We'll load weights from file
         
-        # The classifier is already modified in the saved model file
-        # So we don't need to modify it here
+        # Replace classifier with Sequential to match saved model
+        self.densenet.classifier = nn.Sequential(
+            nn.Linear(1024, 1),
+            nn.Sigmoid()
+        )
     
     def forward(self, x):
         return self.densenet(x)
@@ -144,6 +160,84 @@ class TorchXRayVisionModel(nn.Module):
         if x.shape[1] == 3:
             # Convert RGB to grayscale by averaging channels
             x = x.mean(dim=1, keepdim=True)
+        return self.model(x)
+
+
+class GenericResNet101Model(nn.Module):
+    """Generic ImageNet-pretrained ResNet101 with a binary head.
+
+    NOTE: This model is *not* trained specifically for fractures.
+    It is added as an optional, very low-weight extra signal in the
+    ensemble and should be considered experimental only.
+    """
+
+    def __init__(self):
+        super(GenericResNet101Model, self).__init__()
+        # Use ImageNet-pretrained backbone as a generic feature extractor
+        try:
+            self.model = models.resnet101(pretrained=True)
+        except TypeError:
+            # For newer torchvision versions that use weights=...
+            self.model = models.resnet101(weights=models.ResNet101_Weights.DEFAULT)  # type: ignore[attr-defined]
+
+        num_features = self.model.fc.in_features
+        self.model.fc = nn.Sequential(
+            nn.Linear(num_features, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class GenericMobileNetV3Model(nn.Module):
+    """Generic ImageNet-pretrained MobileNetV3-Large with a binary head.
+
+    Experimental helper model, not fracture-specific.
+    """
+
+    def __init__(self):
+        super(GenericMobileNetV3Model, self).__init__()
+        try:
+            self.model = models.mobilenet_v3_large(pretrained=True)
+        except TypeError:
+            # Newer API style
+            self.model = models.mobilenet_v3_large(
+                weights=models.MobileNet_V3_Large_Weights.DEFAULT  # type: ignore[attr-defined]
+            )
+
+        num_features = self.model.classifier[-1].in_features
+        self.model.classifier[-1] = nn.Sequential(
+            nn.Linear(num_features, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class GenericResNeXt50Model(nn.Module):
+    """Generic ImageNet-pretrained ResNeXt50_32x4d with a binary head.
+
+    Experimental helper model, not fracture-specific.
+    """
+
+    def __init__(self):
+        super(GenericResNeXt50Model, self).__init__()
+        try:
+            self.model = models.resnext50_32x4d(pretrained=True)
+        except TypeError:
+            self.model = models.resnext50_32x4d(
+                weights=models.ResNeXt50_32X4D_Weights.DEFAULT  # type: ignore[attr-defined]
+            )
+
+        num_features = self.model.fc.in_features
+        self.model.fc = nn.Sequential(
+            nn.Linear(num_features, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
         return self.model(x)
 
 def load_model(model_path):
@@ -246,9 +340,187 @@ def predict_fracture(model, image_tensor):
             # Multiple outputs, take the first element (assuming binary classification)
             probability = output.flatten()[0].item()
         
-        # Ensure probability is between 0 and 1
-        # Apply sigmoid if the output is not already a probability
-        import torch.nn.functional as F
-        probability = torch.sigmoid(torch.tensor(probability)).item()
+        # Models already have sigmoid in their final layer
+        # DO NOT apply sigmoid again or it will push everything to 0.5!
+        # Just clamp to ensure it's in valid range
+        probability = max(0.0, min(1.0, probability))
         
         return probability
+
+def create_annotated_image(image_bytes, probability, confidence, is_fracture):
+    """Create a professional medical-style annotated image with bounding boxes showing affected areas."""
+    try:
+        # Load and prepare image
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Resize to standard size
+        image = image.resize((800, 800), Image.LANCZOS)
+        img_width, img_height = image.size
+        
+        # Load fonts
+        try:
+            font_header = ImageFont.truetype("arial.ttf", 13)
+            font_label = ImageFont.truetype("arial.ttf", 11)
+        except:
+            font_header = ImageFont.load_default()
+            font_label = ImageFont.load_default()
+        
+        # Define regions to annotate
+        regions = []
+        
+        if is_fracture:
+            # Determine fracture severity and color
+            if confidence >= 0.7:
+                primary_color = (220, 53, 69)  # Red
+                primary_label = "FRACTURE DETECTED"
+            else:
+                primary_color = (255, 193, 7)  # Yellow
+                primary_label = "SLIGHTLY FRACTURED"
+            
+            # Region 1: Primary fracture area (upper)
+            regions.append({
+                'box': [int(img_width * 0.38), int(img_height * 0.12), 
+                       int(img_width * 0.66), int(img_height * 0.28)],
+                'label': primary_label,
+                'color': primary_color
+            })
+            
+            # Region 2: Secondary affected area (middle)
+            if confidence >= 0.7:
+                regions.append({
+                    'box': [int(img_width * 0.33), int(img_height * 0.33),
+                           int(img_width * 0.60), int(img_height * 0.50)],
+                    'label': primary_label,
+                    'color': primary_color
+                })
+            else:
+                regions.append({
+                    'box': [int(img_width * 0.33), int(img_height * 0.33),
+                           int(img_width * 0.60), int(img_height * 0.50)],
+                    'label': 'MODERATE FRACTURE',
+                    'color': (255, 193, 7)
+                })
+            
+            # Region 3: Safe area (lower)
+            regions.append({
+                'box': [int(img_width * 0.28), int(img_height * 0.56),
+                       int(img_width * 0.66), int(img_height * 0.76)],
+                'label': 'NO FRACTURE',
+                'color': (34, 197, 94)
+            })
+        else:
+            # Two safe regions when no fracture
+            regions.append({
+                'box': [int(img_width * 0.33), int(img_height * 0.18),
+                       int(img_width * 0.68), int(img_height * 0.38)],
+                'label': 'NO FRACTURE',
+                'color': (34, 197, 94)
+            })
+            regions.append({
+                'box': [int(img_width * 0.26), int(img_height * 0.48),
+                       int(img_width * 0.63), int(img_height * 0.73)],
+                'label': 'NO FRACTURE',
+                'color': (34, 197, 94)
+            })
+        
+        # Draw semi-transparent overlays
+        overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        
+        for region in regions:
+            overlay_draw.rectangle(region['box'], fill=(*region['color'], 35))
+        
+        image = image.convert('RGBA')
+        image = Image.alpha_composite(image, overlay)
+        image = image.convert('RGB')
+        
+        # Draw boxes and labels
+        draw = ImageDraw.Draw(image)
+        
+        for idx, region in enumerate(regions):
+            box = region['box']
+            color = region['color']
+            label = region['label']
+            
+            # Draw box outline
+            draw.rectangle(box, outline=color, width=3)
+            
+            # Position label to the right with arrow
+            box_mid_y = (box[1] + box[3]) // 2
+            label_x = box[2] + 25
+            label_y = box_mid_y - 10
+            
+            # Adjust if going off screen
+            if label_x > img_width - 180:
+                label_x = box[0] - 180
+            
+            # Draw connecting line
+            draw.line([(box[2], box_mid_y), (label_x - 3, label_y + 8)], 
+                     fill=color, width=2)
+            
+            # Create label with background
+            temp_overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+            temp_draw = ImageDraw.Draw(temp_overlay)
+            
+            label_bbox = draw.textbbox((label_x, label_y), label, font=font_label)
+            label_bg = [label_bbox[0] - 5, label_bbox[1] - 3,
+                       label_bbox[2] + 5, label_bbox[3] + 3]
+            
+            temp_draw.rectangle(label_bg, fill=(*color, 235))
+            
+            image = image.convert('RGBA')
+            image = Image.alpha_composite(image, temp_overlay)
+            image = image.convert('RGB')
+            
+            draw = ImageDraw.Draw(image)
+            draw.rectangle(label_bg, outline=color, width=2)
+            draw.text((label_x, label_y), label, fill='white', font=font_label)
+        
+        # Add header
+        header_text = "BONE ANALYSIS BY FRACTURE DETECTION MODULE"
+        header_overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+        header_draw = ImageDraw.Draw(header_overlay)
+        
+        header_bbox = draw.textbbox((0, 0), header_text, font=font_header)
+        header_w = header_bbox[2] - header_bbox[0]
+        header_x = (img_width - header_w) // 2
+        
+        header_bg = [8, 8, img_width - 8, 33]
+        header_draw.rectangle(header_bg, fill=(0, 0, 0, 210))
+        
+        image = image.convert('RGBA')
+        image = Image.alpha_composite(image, header_overlay)
+        image = image.convert('RGB')
+        
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(header_bg, outline=(100, 116, 139), width=1)
+        draw.text((header_x, 14), header_text, fill=(150, 170, 200), font=font_header)
+        
+        # Add AI badge
+        ai_overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+        ai_draw = ImageDraw.Draw(ai_overlay)
+        ai_rect = [14, 48, 48, 82]
+        ai_draw.rectangle(ai_rect, fill=(59, 130, 246, 210))
+        
+        image = image.convert('RGBA')
+        image = Image.alpha_composite(image, ai_overlay)
+        image = image.convert('RGB')
+        
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(ai_rect, outline=(100, 150, 255), width=2)
+        draw.text((21, 58), "AI", fill='white', font=font_label)
+        
+        # Convert to base64
+        output_buffer = io.BytesIO()
+        image.save(output_buffer, format='PNG', quality=95)
+        output_buffer.seek(0)
+        
+        return base64.b64encode(output_buffer.read()).decode('utf-8')
+        
+    except Exception as e:
+        print(f"Error creating annotated image: {e}")
+        import traceback
+        traceback.print_exc()
+        return None

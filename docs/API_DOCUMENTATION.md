@@ -199,6 +199,17 @@ POST /predict
 - 401: Unauthorized
 - 500: Processing error
 
+#### Image Preprocessing & Augmentation Notes
+
+The /predict endpoint internally applies a fixed preprocessing pipeline (implemented in backend/model.py) before running the ensemble of models:
+
+- Decodes the uploaded image with PIL and converts it to RGB if needed.
+- Resizes the image to 224×224 pixels.
+- Converts the image to a PyTorch tensor and normalizes channels using ImageNet mean and standard deviation.
+- Adds a batch dimension so the final tensor has shape (1, 3, 224, 224).
+
+No random image augmentations (e.g., flips, random crops, rotation jitter) are applied during API inference. Those augmentations are used only during **model training** to improve robustness and generalization; the production API uses a deterministic preprocessing pipeline so the same X‑ray always yields the same prediction.
+
 ### Medical Chat
 ```
 POST /chat

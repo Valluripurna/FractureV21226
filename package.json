@@ -1,0 +1,9 @@
+{
+	"name": "fracture-v-root",
+	"private": true,
+	"scripts": {
+		"start": "cd frontend && npm start",
+		"frontend-install": "cd frontend && npm install"
+	}
+}
+
